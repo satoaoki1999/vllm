@@ -542,3 +542,11 @@ class BeamSearchParams(
     max_tokens: int
     ignore_eos: bool = False
     temperature: float = 0.0
+
+    # transformer config param
+    pad_token_id = None
+    eos_token_id = None
+    do_sample = False
+    early_stopping = True
+    num_return_sequences = 2
+    length_penalty: float = 1.0

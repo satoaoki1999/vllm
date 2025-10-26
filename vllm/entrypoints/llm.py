@@ -30,6 +30,9 @@ from vllm.transformers_utils.tokenizer_group import TokenizerGroup
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import Counter, deprecate_kwargs, is_list_of
 
+import torch
+import time
+
 logger = init_logger(__name__)
 
 
@@ -491,6 +494,477 @@ class LLM:
             outputs.append(BeamSearchOutput(sequences=best_beams))
 
         return outputs
+
+    def beam_search_mine_1(
+        self,
+        prompts: List[Union[str, List[int]]],
+        params: BeamSearchParams,
+    ) -> List[BeamSearchOutput]:
+        """ 移植 transformers 的 beam search 逻辑 """
+        # step0：需要放在最前面完成的准备工作
+
+        tokenizer = self.get_tokenizer()
+
+        # vllm 自带
+        beam_width = params.beam_width
+        max_tokens = params.max_tokens
+        temperature = params.temperature
+        ignore_eos = params.ignore_eos
+
+        # transformers 引入
+        pad_token_id = tokenizer.pad_token_id
+        eos_token_id = tokenizer.eos_token_id
+        do_sample = params.do_sample
+        early_stopping = params.early_stopping
+        length_penalty = params.length_penalty
+        max_length = params.max_tokens
+        num_beams = params.beam_width
+        num_return_sequences = params.num_return_sequences
+        batch_size = len(prompts)
+
+        # step1: encode 转换成 transformers 的代码的矩阵输入形式（str -> torch.LongTensor）
+
+        # encode
+        if isinstance(prompts[0], str):  # 字符串输入，使用tokenizer编码
+            encoded_inputs = tokenizer(
+                prompts,
+                padding=True,
+                return_tensors="pt",
+                max_length=max_length,
+                truncation=True
+            )
+            input_ids = encoded_inputs["input_ids"]
+        else:  # 已经是token ids, 确保所有序列长度一致，进行padding
+            max_len = max(len(seq) for seq in prompts)
+            input_ids = torch.full(
+                (batch_size, max_len), pad_token_id, dtype=torch.long)
+            for i, seq in enumerate(prompts):
+                input_ids[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+
+        device = input_ids.device
+        _, cur_len = input_ids.shape
+
+        # step2: 移植 transformers 的 beam_search 逻辑
+
+        # step2.1: 初始化beam search需要的变量
+        vocab_size = self.llm_engine.model_config.get_vocab_size()
+        input_ids = input_ids.repeat_interleave(
+            num_beams, dim=0)  # 扩展输入到num_beams倍
+
+        # 初始化running sequences
+        running_sequences = torch.full(
+            (batch_size, num_beams, max_length),
+            fill_value=pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        running_sequences[:, :, :cur_len] = self._unflatten_beam_dim(
+            input_ids, batch_size, num_beams)
+        sequences = running_sequences.detach().clone()
+
+        # 初始化beam scores
+        running_beam_scores = torch.zeros(
+            (batch_size, num_beams), dtype=torch.float, device=device)
+        running_beam_scores[:, 1:] = -1e9
+        beam_scores = torch.full(
+            (batch_size, num_beams), fill_value=-1e9, dtype=torch.float, device=device)
+
+        # 初始化完成状态
+        is_sent_finished = torch.zeros(
+            (batch_size, num_beams), dtype=torch.bool, device=device)
+        is_early_stop_heuristic_unsatisfied = torch.ones(
+            (batch_size, 1), dtype=torch.bool, device=device)
+        next_token_hits_stopping_criteria = torch.zeros(
+            (batch_size, num_beams), dtype=torch.bool, device=device)
+
+        # 初始化beam indices
+        running_beam_indices = torch.full(
+            (batch_size, num_beams, max_length - cur_len),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=device
+        )
+        beam_indices = running_beam_indices.detach().clone()
+
+        # beam search参数
+        n_eos_tokens = len(eos_token_id) if isinstance(
+            eos_token_id, list) else 1
+        beams_to_keep = max(2, 1 + n_eos_tokens) * num_beams
+        top_num_beam_mask = torch.cat(
+            (torch.ones((num_beams), dtype=torch.bool),
+             torch.zeros((beams_to_keep - num_beams), dtype=torch.bool)),
+            dim=0
+        ).to(device)
+
+        decoder_prompt_len = cur_len
+
+        # step2.2: vllm generate - 移植beam search主循环
+        while cur_len < max_length:
+            # 准备模型输入
+            flat_running_sequences = self._flatten_beam_dim(
+                running_sequences[:, :, :cur_len])
+
+            # 这里需要调用vLLM的forward方法获取logits
+            # 假设self.forward接受input_ids并返回logits
+            model_inputs = self.trans_to_vllm_generate_input(
+                # input_ids 转换为 vllm 的 generate 输入 (torch.LongTensor -> PromptType)
+                flat_running_sequences)
+            model_outputs = self.generate(prompts=model_inputs, sampling_params=SamplingParams(logprobs=num_beams,
+                                                                                               max_tokens=1,
+                                                                                               temperature=temperature),
+                                          use_tqdm=False)
+
+            # 停止条件检查
+            next_token_hits_stopping_criteria = torch.zeros(
+                (batch_size, num_beams, beams_to_keep // num_beams), dtype=torch.bool, device=device
+            )
+
+            log_probs = torch.full(
+                # 初始化为一个极小值
+                (batch_size * num_beams, vocab_size), -1e9, dtype=torch.bfloat16)
+            for batch_idx in range(batch_size):
+                for beam_idx in range(num_beams):
+                    idx = batch_idx * num_beams + beam_idx
+                    for cand_idx, (token_id, log_prob_obj) in enumerate(model_outputs[idx].outputs[0].logprobs[0].items()):
+                        log_probs[idx][token_id] = log_prob_obj.logprob
+                        if token_id == eos_token_id:
+                            next_token_hits_stopping_criteria[batch_idx,
+                                                              beam_idx, cand_idx] = True
+                            # print(f"[ERROR] token_id hit eos: {token_id}")
+            log_probs = self._unflatten_beam_dim(
+                log_probs, batch_size, num_beams)
+            log_probs = log_probs + running_beam_scores[:, :, None]
+            log_probs = torch.reshape(
+                log_probs, (batch_size, num_beams * vocab_size))
+
+            # reshape next_token_hits_stopping_criteria
+            next_token_hits_stopping_criteria = next_token_hits_stopping_criteria.reshape(
+                (batch_size, beams_to_keep),
+            )  # transformers的停止逻辑复杂得多
+
+            # 获取top-k候选
+            topk_log_probs, topk_running_sequences, topk_running_beam_indices = self._get_top_k_continuations(
+                accumulated_log_probs=log_probs,
+                running_sequences=running_sequences,
+                running_beam_indices=running_beam_indices,
+                cur_len=cur_len,
+                decoder_prompt_len=decoder_prompt_len,
+                do_sample=do_sample,
+                beams_to_keep=beams_to_keep,
+                num_beams=num_beams,
+                vocab_size=vocab_size,
+                batch_size=batch_size,
+            )
+
+            # 获取下一个iteration的运行beam
+            running_sequences, running_beam_scores, running_beam_indices = self._get_running_beams_for_next_iteration(
+                topk_log_probs=topk_log_probs,
+                topk_running_sequences=topk_running_sequences,
+                topk_running_beam_indices=topk_running_beam_indices,
+                next_token_hits_stopping_criteria=next_token_hits_stopping_criteria,
+                num_beams=num_beams,
+            )
+
+            # 更新完成的beam
+            sequences, beam_scores, beam_indices, is_sent_finished = self._update_finished_beams(
+                sequences=sequences,
+                topk_running_sequences=topk_running_sequences,
+                beam_scores=beam_scores,
+                topk_log_probs=topk_log_probs,
+                beam_indices=beam_indices,
+                topk_running_beam_indices=topk_running_beam_indices,
+                is_early_stop_heuristic_unsatisfied=is_early_stop_heuristic_unsatisfied,
+                is_sent_finished=is_sent_finished,
+                next_token_hits_stopping_criteria=next_token_hits_stopping_criteria,
+                top_num_beam_mask=top_num_beam_mask,
+                num_beams=num_beams,
+                cur_len=cur_len,
+                decoder_prompt_len=decoder_prompt_len,
+                length_penalty=length_penalty,
+                early_stopping=early_stopping,
+            )
+
+            cur_len += 1
+
+            # 检查是否所有序列都已完成
+            is_early_stop_heuristic_unsatisfied = self._check_early_stop_heuristic(
+                is_early_stop_heuristic_unsatisfied=is_early_stop_heuristic_unsatisfied,
+                running_beam_scores=running_beam_scores,
+                beam_scores=beam_scores,
+                is_sent_finished=is_sent_finished,
+                cur_len=cur_len,
+                max_length=max_length,
+                decoder_prompt_len=decoder_prompt_len,
+                early_stopping=early_stopping,
+                length_penalty=length_penalty,
+            )
+
+            if not self._beam_search_has_unfinished_sequences(is_early_stop_heuristic_unsatisfied,
+                                                              is_sent_finished,
+                                                              next_token_hits_stopping_criteria,
+                                                              early_stopping):
+                break
+
+        # step3：decode 输出(torch.Tensor -> List[RequestOutput])
+        sequences = self._flatten_beam_dim(
+            sequences[:, :num_return_sequences, :])
+        beam_scores = self._flatten_beam_dim(
+            beam_scores[:, :num_return_sequences])
+
+        # 转换输出格式
+        outputs = []
+        for i in range(batch_size):
+            batch_outputs = []
+            for j in range(num_return_sequences):
+                idx = i * num_return_sequences + j
+                seq = sequences[idx].tolist()
+                if pad_token_id in seq:  # 移除padding tokens
+                    seq = seq[:seq.index(pad_token_id)]
+                if eos_token_id in seq:  # 移除eos token之后的部分
+                    eos_pos = seq.index(eos_token_id)
+                    seq = seq[:eos_pos + 1]
+                seq.append(eos_token_id)  # 末尾加上单个终止符
+
+                score = beam_scores[idx].item() if idx < len(
+                    beam_scores) else 0.0
+
+                batch_outputs.append(BeamSearchSequence(
+                    text=tokenizer.decode(seq),
+                    tokens=seq,
+                    cum_logprob=score
+                ))
+            outputs.append(BeamSearchOutput(sequences=batch_outputs))
+        return outputs
+
+    def trans_to_vllm_generate_input(self, tensor: torch.Tensor):
+        # tensor shape: batch * beam * ...
+        tokens_id_list = tensor.tolist()
+        return [TokensPrompt(prompt_token_ids=tokens_id) for tokens_id in tokens_id_list]
+
+    # 辅助方法 - 从transformers代码中移植
+    @staticmethod
+    def _flatten_beam_dim(tensor: torch.Tensor) -> torch.Tensor:
+        """[batch_size, num_beams, ...] -> [batch_size * num_beams, ...]"""
+        shape = list(tensor.shape)
+        return torch.reshape(tensor, [shape[0] * shape[1]] + shape[2:])
+
+    @staticmethod
+    def _unflatten_beam_dim(tensor: torch.Tensor, batch_size: int, num_beams: int) -> torch.Tensor:
+        """[batch_size * num_beams, ...] -> [batch_size, num_beams, ...]"""
+        shape = list(tensor.shape)
+        return torch.reshape(tensor, [batch_size, num_beams] + shape[1:])
+
+    @staticmethod
+    def _gather_beams(tensor: torch.Tensor, beam_indices: torch.Tensor) -> torch.Tensor:
+        """Gathers the beam slices indexed by beam_indices into new beam array."""
+        while len(beam_indices.shape) < len(tensor.shape):
+            beam_indices = beam_indices.unsqueeze(-1)
+        gathered_tensor = torch.take_along_dim(
+            input=tensor, indices=beam_indices, dim=1)
+        return gathered_tensor
+
+    @staticmethod
+    def _check_early_stop_heuristic(
+        is_early_stop_heuristic_unsatisfied: torch.Tensor,
+        running_beam_scores: torch.Tensor,
+        beam_scores: torch.Tensor,
+        is_sent_finished: torch.Tensor,
+        cur_len: int,
+        max_length: int,
+        decoder_prompt_len: int,
+        early_stopping: Union[bool, str],
+        length_penalty: float,
+    ):
+        """
+        Determine whether early stopping is possible by checking if the best possible score of running beams
+        could still improve upon the finished ones.
+
+        Mechanism:
+        - Without a length penalty, beam scores typically decrease as more tokens are generated.
+        So, if the *best possible* score from any running beam is already worse than the *worst* finished beam,
+        we can safely stop early.
+        - With a length penalty, scores may increase with longer sequences. In this case, we use heuristics
+        to estimate the best possible score — though this estimate may not always be correct — and stop
+        if no further improvement seems likely.
+
+        We apply different heuristics depending on the value of `early_stopping`:
+        1. `early_stopping == False`:
+        -> Use a heuristic that assumes the best score comes from the current length minus the decoder prompt length.
+        -> See detailed discussion: https://github.com/huggingface/transformers/pull/20901#issuecomment-1369845565
+
+        2. `early_stopping == "never"`:
+        -> Estimate the best score using either `max_length` or `cur_len`, depending on the sign of `length_penalty`.
+        -> A positive length penalty favors longer sequences, so we use `max_length` in that case.
+
+        NOTE: the canonical beam search implementation can be replicated with `early_stopping="never"` and
+        `length_penalty=0.0`, which are NOT the default flags. The default behavior was empirically found to produce
+        better sequences (prior to 2022), and changing it is BC breaking.
+        """
+        if early_stopping == "never" and length_penalty > 0.0:
+            best_hypothetical_length = max_length - decoder_prompt_len
+        else:
+            best_hypothetical_length = cur_len - decoder_prompt_len
+        best_possible_running_score = running_beam_scores[:, :1] / (
+            best_hypothetical_length**length_penalty)
+        worst_finished_score = torch.where(is_sent_finished, torch.min(
+            beam_scores, dim=1, keepdim=True)[0], -1.0e9)
+        return is_early_stop_heuristic_unsatisfied & torch.any(
+            best_possible_running_score > worst_finished_score, dim=-1, keepdim=True
+        )
+
+    @staticmethod
+    def _beam_search_has_unfinished_sequences(
+        is_early_stop_heuristic_unsatisfied: torch.Tensor,
+        is_sent_finished: torch.Tensor,
+        next_token_hits_stopping_criteria: torch.Tensor,
+        early_stopping: Union[bool, str],
+    ):
+        """
+        Beam Search stopping condition -- halts the generation loop if any of these conditions becomes False
+        """
+        # a. Can the open beams improve the top completed scores?
+        improvement_possible = torch.any(is_early_stop_heuristic_unsatisfied)
+
+        # b. Is there still a beam without fully completed sequences? This is only relevant if early_stopping is
+        # enabled, where we want to finish as soon as all beams have a completed sequence.
+        exists_open_beam = ~(torch.all(is_sent_finished)
+                             & (early_stopping is True))
+
+        # c. Have we hit a stopping criteria with all running sequences and have no way to continue? e.g. we have
+        # reached `max_length``
+        valid_continuations = ~torch.all(next_token_hits_stopping_criteria)
+
+        return improvement_possible & exists_open_beam & valid_continuations
+
+    def _get_top_k_continuations(
+        self,
+        accumulated_log_probs: torch.Tensor,
+        running_sequences: torch.Tensor,
+        running_beam_indices: torch.Tensor,
+        cur_len: int,
+        decoder_prompt_len: int,
+        do_sample: bool,
+        beams_to_keep: int,
+        num_beams: int,
+        vocab_size: int,
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """获取top-k候选序列"""
+        if do_sample:
+            probs = torch.nn.functional.softmax(accumulated_log_probs, dim=-1)
+            topk_indices = torch.multinomial(probs, num_samples=beams_to_keep)
+            topk_log_probs = torch.gather(
+                accumulated_log_probs, 1, topk_indices)
+        else:
+            topk_log_probs, topk_indices = torch.topk(
+                accumulated_log_probs, k=beams_to_keep, dim=-1)
+
+        # 恢复beam索引和token索引
+        topk_current_beam_indices = topk_indices // vocab_size
+        topk_running_beam_indices = self._gather_beams(
+            running_beam_indices, topk_current_beam_indices)
+        topk_running_sequences = self._gather_beams(
+            running_sequences, topk_current_beam_indices)
+        topk_ids = topk_indices % vocab_size
+
+        # 更新序列
+        topk_running_sequences[:, :, cur_len] = topk_ids
+
+        # 更新beam indices
+        batch_offset = torch.arange(
+            batch_size, device=topk_ids.device).view(-1, 1) * num_beams
+        batch_modified_indices = topk_current_beam_indices + batch_offset
+        topk_running_beam_indices[:, :, cur_len -
+                                  decoder_prompt_len] = batch_modified_indices
+
+        return topk_log_probs, topk_running_sequences, topk_running_beam_indices
+
+    def _get_running_beams_for_next_iteration(
+        self,
+        topk_log_probs: torch.Tensor,
+        topk_running_sequences: torch.Tensor,
+        topk_running_beam_indices: torch.Tensor,
+        next_token_hits_stopping_criteria: torch.Tensor,
+        num_beams: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Given the top-K continuations, their scores, and whether they hit a stopping criteria, select the
+        best non-finished beams to continue beam search in the next iteration.
+        """
+        # To prevent these just finished sequences from being used in subsequent iterations, set their log probs
+        # to a very large negative value
+        topk_running_log_probs = topk_log_probs + \
+            next_token_hits_stopping_criteria.to(torch.float32) * -1.0e9
+
+        next_topk_indices = torch.topk(topk_running_log_probs, k=num_beams)[1]
+        running_sequences = self._gather_beams(
+            topk_running_sequences, next_topk_indices)
+        running_beam_scores = self._gather_beams(
+            topk_running_log_probs, next_topk_indices)
+        running_beam_indices = self._gather_beams(
+            topk_running_beam_indices, next_topk_indices)
+        return running_sequences, running_beam_scores, running_beam_indices
+
+    def _update_finished_beams(
+        self,
+        sequences: torch.Tensor,
+        topk_running_sequences: torch.Tensor,
+        beam_scores: torch.Tensor,
+        topk_log_probs: torch.Tensor,
+        beam_indices: torch.Tensor,
+        topk_running_beam_indices: torch.Tensor,
+        is_early_stop_heuristic_unsatisfied: torch.Tensor,
+        is_sent_finished: torch.Tensor,
+        next_token_hits_stopping_criteria: torch.Tensor,
+        top_num_beam_mask: torch.Tensor,
+        num_beams: int,
+        cur_len: int,
+        decoder_prompt_len: int,
+        length_penalty: float,
+        early_stopping: Union[bool, str],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Updates the finished beams if (and only if) there are new completed sequences that have a higher score than
+        the current finished sequences.
+        """
+        # Only the top `num_beam` sequences can be considered for the final returned sequences. Remember: the
+        # remaining sequences only exist as a backup to ensure that we have at least `num_beams` sequences to
+        # continue.
+        did_top_num_beams_just_finished = next_token_hits_stopping_criteria & top_num_beam_mask[
+            None, :]
+
+        # Further process topk logits for the finished beams
+        # - add length penalty
+        topk_log_probs = topk_log_probs / \
+            ((cur_len + 1 - decoder_prompt_len) ** length_penalty)
+        # - make sure no scores can be added anymore if beam is full and early stopping is on
+        beams_in_batch_are_full = torch.all(
+            is_sent_finished, axis=-1, keepdims=True) & (early_stopping is True)
+        topk_log_probs += beams_in_batch_are_full.to(torch.float32) * -1.0e9
+        # - make sure no scores can be added anymore if improvement is not possible
+        topk_log_probs += (~is_early_stop_heuristic_unsatisfied).to(torch.float32) * -1.0e9
+
+        # - make sure still running sequences cannot be chosen as finalized beam
+        topk_log_probs += (~did_top_num_beams_just_finished) * -1.0e9
+
+        # Get finalized  `num_beam` sequences for the next generation step -- combine the previous finalized
+        # data with the new finalized sequences (if any, non-finalized sequences have a very large negative score
+        # in this step), and keep the best `num_beams` sequences.
+        merged_sequences = torch.cat(
+            (sequences, topk_running_sequences), dim=1)
+        merged_scores = torch.cat((beam_scores, topk_log_probs), dim=1)
+        merged_beam_indices = torch.cat(
+            (beam_indices, topk_running_beam_indices), dim=1)
+        merged_is_sent_finished = torch.cat(
+            (is_sent_finished, did_top_num_beams_just_finished), dim=1)
+        topk_merged_indices = torch.topk(merged_scores, k=num_beams)[1]
+        sequences = self._gather_beams(merged_sequences, topk_merged_indices)
+        beam_scores = self._gather_beams(merged_scores, topk_merged_indices)
+        beam_indices = self._gather_beams(
+            merged_beam_indices, topk_merged_indices)
+        is_sent_finished = self._gather_beams(
+            merged_is_sent_finished, topk_merged_indices)
+        return sequences, beam_scores, beam_indices, is_sent_finished
 
     def chat(
         self,
