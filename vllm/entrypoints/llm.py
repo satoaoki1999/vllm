@@ -472,7 +472,7 @@ class LLM:
                                 logprob_obj.logprob)
 
                             if token_id == tokenizer.eos_token_id and \
-                                not ignore_eos:
+                                    not ignore_eos:
                                 instance.completed.append(new_beam)
                             else:
                                 instance_new_beams.append(new_beam)
@@ -495,98 +495,177 @@ class LLM:
 
         return outputs
 
-    def beam_search_mine_1(
+    def beam_search_by_official_v063(
         self,
         prompts: List[Union[str, List[int]]],
         params: BeamSearchParams,
     ) -> List[BeamSearchOutput]:
-        """ 移植 transformers 的 beam search 逻辑 """
-        # step0：需要放在最前面完成的准备工作
+        return self.beam_search(prompts, params)
 
-        tokenizer = self.get_tokenizer()
+    def beam_search_by_official_v063_opt(
+        self,
+        prompts: List[Union[str, List[int]]],
+        params: BeamSearchParams,
+    ) -> List[BeamSearchOutput]:
+        """
+        Generate sequences using beam search.
 
-        # vllm 自带
+        Args:
+            prompts: A list of prompts. Each prompt can be a string or a list
+                of token IDs.
+            params: The beam search parameters.
+
+        TODO: how does beam search work together with length penalty, frequency
+        penalty, and stopping criteria, etc.?
+        """
+
         beam_width = params.beam_width
         max_tokens = params.max_tokens
         temperature = params.temperature
         ignore_eos = params.ignore_eos
 
-        # transformers 引入
-        pad_token_id = tokenizer.pad_token_id
-        eos_token_id = tokenizer.eos_token_id
+        tokenizer = self.get_tokenizer()
+        # generate 2 * beam_width candidates at each step
+        # following the huggingface transformers implementation
+        # at https://github.com/huggingface/transformers/blob/e15687fffe5c9d20598a19aeab721ae0a7580f8a/src/transformers/generation/beam_search.py#L534 # noqa
+        beam_search_params = SamplingParams(logprobs=2 * beam_width,
+                                            max_tokens=1,
+                                            temperature=temperature)
+        instances: List[BeamSearchInstance] = []
+
+        for prompt in prompts:
+            prompt_tokens = prompt if isinstance(
+                prompt, list) else tokenizer.encode(prompt)
+            instances.append(BeamSearchInstance(prompt_tokens))
+
+        for _ in range(max_tokens):
+            all_beams: List[BeamSearchSequence] = list(
+                sum((instance.beams for instance in instances), []))
+            pos = [0] + list(
+                itertools.accumulate(
+                    len(instance.beams) for instance in instances))
+            instance_start_and_end: List[Tuple[int, int]] = list(
+                zip(pos[:-1], pos[1:]))
+
+            if len(all_beams) == 0:
+                break
+
+            prompts_batch = [
+                TokensPrompt(prompt_token_ids=beam.tokens)
+                for beam in all_beams
+            ]
+
+            # only runs for one step
+            # we don't need to use tqdm here
+            output = self.generate(prompts_batch,
+                                   sampling_params=beam_search_params,
+                                   use_tqdm=False)
+
+            for (start, end), instance in zip(instance_start_and_end,
+                                              instances):
+                instance_new_beams = []
+                for i in range(start, end):
+                    current_beam = all_beams[i]
+                    result = output[i]
+
+                    if result.outputs[0].logprobs is not None:
+                        # if `result.outputs[0].logprobs` is None, it means
+                        # the sequence is completed because of the max-model-len
+                        # or abortion. we don't need to add it to the new beams.
+                        logprobs = result.outputs[0].logprobs[0]
+                        for token_id, logprob_obj in logprobs.items():
+                            new_beam = BeamSearchSequence(
+                                tokens=current_beam.tokens + [token_id],
+                                cum_logprob=current_beam.cum_logprob +
+                                logprob_obj.logprob)
+
+                            if token_id == tokenizer.eos_token_id and \
+                                    not ignore_eos:
+                                instance.completed.append(new_beam)
+                            else:
+                                instance_new_beams.append(new_beam)
+                sorted_beams = sorted(instance_new_beams,
+                                      key=lambda x: x.cum_logprob,
+                                      reverse=True)
+                instance.beams = sorted_beams[:beam_width]
+                if len(instance.completed) >= beam_width and sorted_beams[0].cum_logprob < min([completed_seq.cum_logprob for completed_seq in instance.completed]):
+                    instance.beams.clear()
+
+        outputs = []
+        for instance in instances:
+            instance.completed.extend(instance.beams)
+            sorted_completed = sorted(instance.completed,
+                                      key=lambda x: x.cum_logprob,
+                                      reverse=True)
+            best_beams = sorted_completed[:beam_width]
+
+            for beam in best_beams:
+                beam.text = tokenizer.decode(beam.tokens)
+            outputs.append(BeamSearchOutput(sequences=best_beams))
+
+        return outputs
+
+    def beam_search_by_transformers_vectoring(
+        self,
+        prompts: List[Union[str, List[int]]],
+        params: BeamSearchParams,
+    ) -> List[BeamSearchOutput]:
+        """
+        Generate sequences using beam search.
+
+        Args:
+            prompts: A list of prompts. Each prompt can be a string or a list
+                of token IDs.
+            params: The beam search parameters.
+        """
+        tokenizer = self.get_tokenizer()
+
+        # step1: param process
+        temperature = params.temperature
+        ignore_eos = params.ignore_eos
         do_sample = params.do_sample
         early_stopping = params.early_stopping
         length_penalty = params.length_penalty
         max_length = params.max_tokens
         num_beams = params.beam_width
-        num_return_sequences = params.num_return_sequences
+        num_return_sequences = params.num_return_sequences if params.num_return_sequences is not None else num_beams
+        pad_token_id = params.pad_token_id if params.pad_token_id is not None else tokenizer.pad_token_id
+        eos_token_id = params.eos_token_id if params.eos_token_id is not None else tokenizer.eos_token_id
+        vocab_size = self.llm_engine.model_config.get_vocab_size()
         batch_size = len(prompts)
 
-        # step1: encode 转换成 transformers 的代码的矩阵输入形式（str -> torch.LongTensor）
-
-        # encode
-        if isinstance(prompts[0], str):  # 字符串输入，使用tokenizer编码
+        # step2: encode
+        if isinstance(prompts[0], str):  # prompts are strings
             encoded_inputs = tokenizer(
                 prompts,
                 padding=True,
                 return_tensors="pt",
                 max_length=max_length,
-                truncation=True
+                truncation=True,
             )
             input_ids = encoded_inputs["input_ids"]
-        else:  # 已经是token ids, 确保所有序列长度一致，进行padding
+        else:  # prompts are token ids
             max_len = max(len(seq) for seq in prompts)
             input_ids = torch.full(
                 (batch_size, max_len), pad_token_id, dtype=torch.long)
             for i, seq in enumerate(prompts):
                 input_ids[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
 
-        device = input_ids.device
+        device = input_ids.device  # cpu
         _, cur_len = input_ids.shape
 
-        # step2: 移植 transformers 的 beam_search 逻辑
+        # step3: vector based beam-search(from transformer)
 
-        # step2.1: 初始化beam search需要的变量
-        vocab_size = self.llm_engine.model_config.get_vocab_size()
+        # expand to size [batch * num_beams, prompts_max_len, vocab_size]
         input_ids = input_ids.repeat_interleave(
-            num_beams, dim=0)  # 扩展输入到num_beams倍
+            num_beams, dim=0)
 
-        # 初始化running sequences
-        running_sequences = torch.full(
-            (batch_size, num_beams, max_length),
-            fill_value=pad_token_id,
-            dtype=torch.long,
-            device=device,
-        )
-        running_sequences[:, :, :cur_len] = self._unflatten_beam_dim(
-            input_ids, batch_size, num_beams)
-        sequences = running_sequences.detach().clone()
+        decoder_prompt_len = cur_len
 
-        # 初始化beam scores
-        running_beam_scores = torch.zeros(
-            (batch_size, num_beams), dtype=torch.float, device=device)
-        running_beam_scores[:, 1:] = -1e9
-        beam_scores = torch.full(
-            (batch_size, num_beams), fill_value=-1e9, dtype=torch.float, device=device)
-
-        # 初始化完成状态
-        is_sent_finished = torch.zeros(
-            (batch_size, num_beams), dtype=torch.bool, device=device)
-        is_early_stop_heuristic_unsatisfied = torch.ones(
-            (batch_size, 1), dtype=torch.bool, device=device)
-        next_token_hits_stopping_criteria = torch.zeros(
-            (batch_size, num_beams), dtype=torch.bool, device=device)
-
-        # 初始化beam indices
-        running_beam_indices = torch.full(
-            (batch_size, num_beams, max_length - cur_len),
-            fill_value=-1,
-            dtype=torch.int32,
-            device=device
-        )
-        beam_indices = running_beam_indices.detach().clone()
-
-        # beam search参数
+        # At each beam search step, we want to keep top K [K = (number of EOS tokens + 1) * `num_beams`] candidates
+        # with the highest log-probabilities, or sample K continuations without replacement. We gather the top K
+        # (as opposed to `num_beams`, or any number lower than K) so that we have at least `num_beams` sequences
+        # non-finished to continue the live beam search, in case the top `num_beams` all select an EOS token.
         n_eos_tokens = len(eos_token_id) if isinstance(
             eos_token_id, list) else 1
         beams_to_keep = max(2, 1 + n_eos_tokens) * num_beams
@@ -596,53 +675,80 @@ class LLM:
             dim=0
         ).to(device)
 
-        decoder_prompt_len = cur_len
+        # per batch, beam-item holding current token in loop and completed sequences
+        output_fill_value = pad_token_id or eos_token_id[0] if eos_token_id is not None else -1
+        running_sequences = torch.full(
+            (batch_size, num_beams, max_length),
+            fill_value=output_fill_value,
+            dtype=torch.long,
+            device=device,
+        )
+        running_sequences[:, :, :cur_len] = self._unflatten_beam_dim(
+            input_ids, batch_size, num_beams)
+        sequences = running_sequences.detach().clone()
 
-        # step2.2: vllm generate - 移植beam search主循环
+        # per batch, beam-item score, logprobs
+        # initialise score of first beam with 0 and the rest with -1e9. This makes sure that only tokens
+        # of the first beam are considered to avoid sampling the exact same tokens across all beams.
+        running_beam_scores = torch.zeros(
+            (batch_size, num_beams), dtype=torch.float, device=device)
+        running_beam_scores[:, 1:] = -1e9
+        beam_scores = torch.full(
+            (batch_size, num_beams), fill_value=-1e9, dtype=torch.float, device=device)
+
+        # per batch, beam-item state bit indicating if sentence has finished.
+        is_sent_finished = torch.zeros(
+            (batch_size, num_beams), dtype=torch.bool, device=device)
+
+        # per batch state bit indicating if there is a possibility to improve the best finished sentence.
+        is_early_stop_heuristic_unsatisfied = torch.ones(
+            (batch_size, 1), dtype=torch.bool, device=device)
+
+        # per batch, beam-item state bit indicating if there are valid continuations.
+        next_token_hits_stopping_criteria = torch.zeros(
+            (batch_size, num_beams), dtype=torch.bool, device=device)
+
+        # per batch selected beam indices
+        running_beam_indices = torch.full(
+            (batch_size, num_beams, max_length - cur_len),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=device
+        )
+        beam_indices = running_beam_indices.detach().clone()
+
         while cur_len < max_length:
-            # 准备模型输入
+            # a. Forward current tokens, obtain the logits
             flat_running_sequences = self._flatten_beam_dim(
                 running_sequences[:, :, :cur_len])
 
-            # 这里需要调用vLLM的forward方法获取logits
-            # 假设self.forward接受input_ids并返回logits
-            model_inputs = self.trans_to_vllm_generate_input(
-                # input_ids 转换为 vllm 的 generate 输入 (torch.LongTensor -> PromptType)
-                flat_running_sequences)
-            model_outputs = self.generate(prompts=model_inputs, sampling_params=SamplingParams(logprobs=num_beams,
+            model_inputs = self._get_token_prompts(flat_running_sequences)
+            model_outputs = self.generate(prompts=model_inputs, sampling_params=SamplingParams(logprobs=beams_to_keep // num_beams,  # beams_to_keep // num_beams == 2
                                                                                                max_tokens=1,
                                                                                                temperature=temperature),
                                           use_tqdm=False)
 
-            # 停止条件检查
-            next_token_hits_stopping_criteria = torch.zeros(
-                (batch_size, num_beams, beams_to_keep // num_beams), dtype=torch.bool, device=device
-            )
-
+            # b. Compute log probs -- get log probabilities from logits, process logits with processors (*e.g.*
+            # `temperature`, ...), and add new logprobs to existing running logprobs scores.
             log_probs = torch.full(
-                # 初始化为一个极小值
                 (batch_size * num_beams, vocab_size), -1e9, dtype=torch.bfloat16)
             for batch_idx in range(batch_size):
                 for beam_idx in range(num_beams):
                     idx = batch_idx * num_beams + beam_idx
-                    for cand_idx, (token_id, log_prob_obj) in enumerate(model_outputs[idx].outputs[0].logprobs[0].items()):
+                    # for cand_idx, (token_id, log_prob_obj) in enumerate(model_outputs[idx].outputs[0].logprobs[0].items()):
+                    kv = list(
+                        model_outputs[idx].outputs[0].logprobs[0].items())
+                    for cand_idx in range(num_beams):
+                        (token_id, log_prob_obj) = kv[cand_idx]
                         log_probs[idx][token_id] = log_prob_obj.logprob
-                        if token_id == eos_token_id:
-                            next_token_hits_stopping_criteria[batch_idx,
-                                                              beam_idx, cand_idx] = True
-                            # print(f"[ERROR] token_id hit eos: {token_id}")
             log_probs = self._unflatten_beam_dim(
                 log_probs, batch_size, num_beams)
             log_probs = log_probs + running_beam_scores[:, :, None]
             log_probs = torch.reshape(
                 log_probs, (batch_size, num_beams * vocab_size))
 
-            # reshape next_token_hits_stopping_criteria
-            next_token_hits_stopping_criteria = next_token_hits_stopping_criteria.reshape(
-                (batch_size, beams_to_keep),
-            )  # transformers的停止逻辑复杂得多
-
-            # 获取top-k候选
+            # c. Retrieve top-K continuations, i.e. select the next token (greedy or sampling) and then keep the best
+            # continuations among all beams based on the accumulated scores.
             topk_log_probs, topk_running_sequences, topk_running_beam_indices = self._get_top_k_continuations(
                 accumulated_log_probs=log_probs,
                 running_sequences=running_sequences,
@@ -656,7 +762,12 @@ class LLM:
                 batch_size=batch_size,
             )
 
-            # 获取下一个iteration的运行beam
+            # d. Check which running sequences have finished
+            if not ignore_eos:
+                next_token_hits_stopping_criteria = topk_running_sequences[:,
+                                                                           :, cur_len] == eos_token_id
+
+            # e. Get the non-finished running `num_beams` sequences for the next generation step
             running_sequences, running_beam_scores, running_beam_indices = self._get_running_beams_for_next_iteration(
                 topk_log_probs=topk_log_probs,
                 topk_running_sequences=topk_running_sequences,
@@ -665,7 +776,7 @@ class LLM:
                 num_beams=num_beams,
             )
 
-            # 更新完成的beam
+            # f. Update the completed beams if a new high score in a finished sequence is found
             sequences, beam_scores, beam_indices, is_sent_finished = self._update_finished_beams(
                 sequences=sequences,
                 topk_running_sequences=topk_running_sequences,
@@ -684,9 +795,9 @@ class LLM:
                 early_stopping=early_stopping,
             )
 
+            # g. Prepare remaining data for the next iteration, including computing the stopping condition for
+            # beam search as a whole (as opposed to individual beams, i.e. `stopping_criteria`)
             cur_len += 1
-
-            # 检查是否所有序列都已完成
             is_early_stop_heuristic_unsatisfied = self._check_early_stop_heuristic(
                 is_early_stop_heuristic_unsatisfied=is_early_stop_heuristic_unsatisfied,
                 running_beam_scores=running_beam_scores,
@@ -698,32 +809,30 @@ class LLM:
                 early_stopping=early_stopping,
                 length_penalty=length_penalty,
             )
-
             if not self._beam_search_has_unfinished_sequences(is_early_stop_heuristic_unsatisfied,
                                                               is_sent_finished,
                                                               next_token_hits_stopping_criteria,
                                                               early_stopping):
-                break
+                break  # if all sequences are finished, break directly
 
-        # step3：decode 输出(torch.Tensor -> List[RequestOutput])
+        # step4：output
         sequences = self._flatten_beam_dim(
             sequences[:, :num_return_sequences, :])
         beam_scores = self._flatten_beam_dim(
             beam_scores[:, :num_return_sequences])
 
-        # 转换输出格式
         outputs = []
         for i in range(batch_size):
             batch_outputs = []
             for j in range(num_return_sequences):
                 idx = i * num_return_sequences + j
                 seq = sequences[idx].tolist()
-                if pad_token_id in seq:  # 移除padding tokens
+                if pad_token_id in seq:
                     seq = seq[:seq.index(pad_token_id)]
-                if eos_token_id in seq:  # 移除eos token之后的部分
+                if eos_token_id in seq:
                     eos_pos = seq.index(eos_token_id)
                     seq = seq[:eos_pos + 1]
-                seq.append(eos_token_id)  # 末尾加上单个终止符
+                # seq.append(eos_token_id)
 
                 score = beam_scores[idx].item() if idx < len(
                     beam_scores) else 0.0
@@ -736,12 +845,12 @@ class LLM:
             outputs.append(BeamSearchOutput(sequences=batch_outputs))
         return outputs
 
-    def trans_to_vllm_generate_input(self, tensor: torch.Tensor):
+    @staticmethod
+    def _get_token_prompts(tensor: torch.Tensor):
         # tensor shape: batch * beam * ...
         tokens_id_list = tensor.tolist()
         return [TokensPrompt(prompt_token_ids=tokens_id) for tokens_id in tokens_id_list]
 
-    # 辅助方法 - 从transformers代码中移植
     @staticmethod
     def _flatten_beam_dim(tensor: torch.Tensor) -> torch.Tensor:
         """[batch_size, num_beams, ...] -> [batch_size * num_beams, ...]"""
@@ -965,6 +1074,246 @@ class LLM:
         is_sent_finished = self._gather_beams(
             merged_is_sent_finished, topk_merged_indices)
         return sequences, beam_scores, beam_indices, is_sent_finished
+
+    def beam_search_expr(
+        self,
+        prompts: List[Union[str, List[int]]],
+        params: BeamSearchParams,
+    ) -> List[BeamSearchOutput]:
+        """ 移植 transformers 的 beam search 逻辑 """
+        # step0：需要放在最前面完成的准备工作
+
+        tokenizer = self.get_tokenizer()
+
+        # vllm 自带
+        beam_width = params.beam_width
+        max_tokens = params.max_tokens
+        temperature = params.temperature
+        ignore_eos = params.ignore_eos
+
+        # transformers 引入
+        pad_token_id = tokenizer.pad_token_id
+        eos_token_id = tokenizer.eos_token_id
+        do_sample = params.do_sample
+        early_stopping = params.early_stopping
+        length_penalty = params.length_penalty
+        max_length = params.max_tokens
+        num_beams = params.beam_width
+        num_return_sequences = params.num_return_sequences
+        batch_size = len(prompts)
+
+        # step1: encode 转换成 transformers 的代码的矩阵输入形式（str -> torch.LongTensor）
+
+        # encode
+        if isinstance(prompts[0], str):  # 字符串输入，使用tokenizer编码
+            encoded_inputs = tokenizer(
+                prompts,
+                padding=True,
+                return_tensors="pt",
+                max_length=max_length,
+                truncation=True
+            )
+            input_ids = encoded_inputs["input_ids"]
+        else:  # 已经是token ids, 确保所有序列长度一致，进行padding
+            max_len = max(len(seq) for seq in prompts)
+            input_ids = torch.full(
+                (batch_size, max_len), pad_token_id, dtype=torch.long)
+            for i, seq in enumerate(prompts):
+                input_ids[i, :len(seq)] = torch.tensor(seq, dtype=torch.long)
+
+        device = input_ids.device
+        _, cur_len = input_ids.shape
+
+        # step2: 移植 transformers 的 beam_search 逻辑
+
+        # step2.1: 初始化beam search需要的变量
+        vocab_size = self.llm_engine.model_config.get_vocab_size()
+        input_ids = input_ids.repeat_interleave(
+            num_beams, dim=0)  # 扩展输入到num_beams倍
+
+        # 初始化running sequences
+        running_sequences = torch.full(
+            (batch_size, num_beams, max_length),
+            fill_value=pad_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        running_sequences[:, :, :cur_len] = self._unflatten_beam_dim(
+            input_ids, batch_size, num_beams)
+        sequences = running_sequences.detach().clone()
+
+        # 初始化beam scores
+        running_beam_scores = torch.zeros(
+            (batch_size, num_beams), dtype=torch.float, device=device)
+        running_beam_scores[:, 1:] = -1e9
+        beam_scores = torch.full(
+            (batch_size, num_beams), fill_value=-1e9, dtype=torch.float, device=device)
+
+        # 初始化完成状态
+        is_sent_finished = torch.zeros(
+            (batch_size, num_beams), dtype=torch.bool, device=device)
+        is_early_stop_heuristic_unsatisfied = torch.ones(
+            (batch_size, 1), dtype=torch.bool, device=device)
+        next_token_hits_stopping_criteria = torch.zeros(
+            (batch_size, num_beams), dtype=torch.bool, device=device)
+
+        # 初始化beam indices
+        running_beam_indices = torch.full(
+            (batch_size, num_beams, max_length - cur_len),
+            fill_value=-1,
+            dtype=torch.int32,
+            device=device
+        )
+        beam_indices = running_beam_indices.detach().clone()
+
+        # beam search参数
+        n_eos_tokens = len(eos_token_id) if isinstance(
+            eos_token_id, list) else 1
+        beams_to_keep = max(2, 1 + n_eos_tokens) * num_beams
+        top_num_beam_mask = torch.cat(
+            (torch.ones((num_beams), dtype=torch.bool),
+             torch.zeros((beams_to_keep - num_beams), dtype=torch.bool)),
+            dim=0
+        ).to(device)
+
+        decoder_prompt_len = cur_len
+
+        # step2.2: vllm generate - 移植beam search主循环
+        while cur_len < max_length:
+            # 准备模型输入
+            flat_running_sequences = self._flatten_beam_dim(
+                running_sequences[:, :, :cur_len])
+
+            # 这里需要调用vLLM的forward方法获取logits
+            # 假设self.forward接受input_ids并返回logits
+            # input_ids 转换为 vllm 的 generate 输入 (torch.LongTensor -> PromptType)
+            model_inputs = self._get_token_prompts(flat_running_sequences)
+            model_outputs = self.generate(prompts=model_inputs, sampling_params=SamplingParams(logprobs=num_beams,
+                                                                                               max_tokens=1,
+                                                                                               temperature=temperature),
+                                          use_tqdm=False)
+
+            # 停止条件检查
+            next_token_hits_stopping_criteria = torch.zeros(
+                (batch_size, num_beams, beams_to_keep // num_beams), dtype=torch.bool, device=device
+            )
+
+            log_probs = torch.full(
+                # 初始化为一个极小值
+                (batch_size * num_beams, vocab_size), -1e9, dtype=torch.bfloat16)
+            for batch_idx in range(batch_size):
+                for beam_idx in range(num_beams):
+                    idx = batch_idx * num_beams + beam_idx
+                    # for cand_idx, (token_id, log_prob_obj) in enumerate(model_outputs[idx].outputs[0].logprobs[0].items()):
+                    kv = list(
+                        model_outputs[idx].outputs[0].logprobs[0].items())
+                    for cand_idx in range(num_beams):
+                        (token_id, log_prob_obj) = kv[cand_idx]
+                        log_probs[idx][token_id] = log_prob_obj.logprob
+            log_probs = self._unflatten_beam_dim(
+                log_probs, batch_size, num_beams)
+            log_probs = log_probs + running_beam_scores[:, :, None]
+            log_probs = torch.reshape(
+                log_probs, (batch_size, num_beams * vocab_size))
+
+            # transformers的停止逻辑复杂得多
+            if not ignore_eos:
+                next_token_hits_stopping_criteria = topk_running_sequences[:,
+                                                                           :, cur_len] == eos_token_id
+
+            # 获取top-k候选
+            topk_log_probs, topk_running_sequences, topk_running_beam_indices = self._get_top_k_continuations(
+                accumulated_log_probs=log_probs,
+                running_sequences=running_sequences,
+                running_beam_indices=running_beam_indices,
+                cur_len=cur_len,
+                decoder_prompt_len=decoder_prompt_len,
+                do_sample=do_sample,
+                beams_to_keep=beams_to_keep,
+                num_beams=num_beams,
+                vocab_size=vocab_size,
+                batch_size=batch_size,
+            )
+
+            # 获取下一个iteration的运行beam
+            running_sequences, running_beam_scores, running_beam_indices = self._get_running_beams_for_next_iteration(
+                topk_log_probs=topk_log_probs,
+                topk_running_sequences=topk_running_sequences,
+                topk_running_beam_indices=topk_running_beam_indices,
+                next_token_hits_stopping_criteria=next_token_hits_stopping_criteria,
+                num_beams=num_beams,
+            )
+
+            # 更新完成的beam
+            sequences, beam_scores, beam_indices, is_sent_finished = self._update_finished_beams(
+                sequences=sequences,
+                topk_running_sequences=topk_running_sequences,
+                beam_scores=beam_scores,
+                topk_log_probs=topk_log_probs,
+                beam_indices=beam_indices,
+                topk_running_beam_indices=topk_running_beam_indices,
+                is_early_stop_heuristic_unsatisfied=is_early_stop_heuristic_unsatisfied,
+                is_sent_finished=is_sent_finished,
+                next_token_hits_stopping_criteria=next_token_hits_stopping_criteria,
+                top_num_beam_mask=top_num_beam_mask,
+                num_beams=num_beams,
+                cur_len=cur_len,
+                decoder_prompt_len=decoder_prompt_len,
+                length_penalty=length_penalty,
+                early_stopping=early_stopping,
+            )
+
+            cur_len += 1
+
+            # 检查是否所有序列都已完成
+            is_early_stop_heuristic_unsatisfied = self._check_early_stop_heuristic(
+                is_early_stop_heuristic_unsatisfied=is_early_stop_heuristic_unsatisfied,
+                running_beam_scores=running_beam_scores,
+                beam_scores=beam_scores,
+                is_sent_finished=is_sent_finished,
+                cur_len=cur_len,
+                max_length=max_length,
+                decoder_prompt_len=decoder_prompt_len,
+                early_stopping=early_stopping,
+                length_penalty=length_penalty,
+            )
+
+            if not self._beam_search_has_unfinished_sequences(is_early_stop_heuristic_unsatisfied,
+                                                              is_sent_finished,
+                                                              next_token_hits_stopping_criteria,
+                                                              early_stopping):
+                break
+
+        # step3：decode 输出(torch.Tensor -> List[RequestOutput])
+        sequences = self._flatten_beam_dim(
+            sequences[:, :num_return_sequences, :])
+        beam_scores = self._flatten_beam_dim(
+            beam_scores[:, :num_return_sequences])
+
+        # 转换输出格式
+        outputs = []
+        for i in range(batch_size):
+            batch_outputs = []
+            for j in range(num_return_sequences):
+                idx = i * num_return_sequences + j
+                seq = sequences[idx].tolist()
+                if pad_token_id in seq:  # 移除padding tokens
+                    seq = seq[:seq.index(pad_token_id)]
+                if eos_token_id in seq:  # 移除eos token之后的部分
+                    eos_pos = seq.index(eos_token_id)
+                    seq = seq[:eos_pos + 1]
+                seq.append(eos_token_id)  # 末尾加上单个终止符
+
+                score = beam_scores[idx].item() if idx < len(
+                    beam_scores) else 0.0
+
+                batch_outputs.append(BeamSearchSequence(
+                    text=tokenizer.decode(seq),
+                    tokens=seq,
+                    cum_logprob=score
+                ))
+            outputs.append(BeamSearchOutput(sequences=batch_outputs))
+        return outputs
 
     def chat(
         self,
@@ -1379,7 +1728,8 @@ class LLM:
                             # Calculate tokens only for RequestOutput
                             assert output.prompt_token_ids is not None
                             total_in_toks += len(output.prompt_token_ids)
-                            in_spd = total_in_toks / pbar.format_dict["elapsed"]
+                            in_spd = total_in_toks / \
+                                pbar.format_dict["elapsed"]
                             total_out_toks += sum(
                                 len(stp.token_ids) for stp in output.outputs)
                             out_spd = (total_out_toks /
