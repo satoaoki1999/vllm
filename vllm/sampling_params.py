@@ -7,7 +7,7 @@ import warnings
 from dataclasses import field
 from enum import Enum, IntEnum
 from functools import cached_property
-from typing import Annotated, Any
+from typing import Annotated, Any, Optional
 
 import msgspec
 from pydantic.dataclasses import dataclass
@@ -657,3 +657,8 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    num_return_sequences: Optional[int] = None
+    do_sample: bool = False
+    early_stopping: bool = True
+    pad_token_id: Optional[int] = None
+    eos_token_id: Optional[int] = None
