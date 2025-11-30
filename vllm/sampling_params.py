@@ -595,3 +595,7 @@ class BeamSearchParams(
     temperature: float = 0.0
     length_penalty: float = 1.0
     include_stop_str_in_output: bool = False
+    num_return_sequences: Optional[int] = None
+    early_stopping: bool = False
+    pad_token_id: Optional[int] = None
+    eos_token_id: Optional[int] = None
