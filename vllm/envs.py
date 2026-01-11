@@ -91,6 +91,7 @@ if TYPE_CHECKING:
     VLLM_TORCH_PROFILER_WITH_FLOPS: bool = False
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
+    VLLM_ALLOW_DEPRECATED_BEAM_SEARCH: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
     VLLM_USE_V1: bool = True
@@ -378,6 +379,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when using the flash-attention backend.
     "VLLM_FLASH_ATTN_VERSION":
     lambda: maybe_convert_int(os.environ.get("VLLM_FLASH_ATTN_VERSION", None)),
+
+    # If set, allowing the use of deprecated beam search implementation
+    "VLLM_ALLOW_DEPRECATED_BEAM_SEARCH":
+    lambda: os.environ.get("VLLM_ALLOW_DEPRECATED_BEAM_SEARCH", "0") == "1",
+
+    # Internal flag to enable Dynamo graph capture
+    "VLLM_TEST_DYNAMO_GRAPH_CAPTURE":
+    lambda: int(os.environ.get("VLLM_TEST_DYNAMO_GRAPH_CAPTURE", "0")),
+    "VLLM_DYNAMO_USE_CUSTOM_DISPATCHER":
+    lambda:
+    (os.environ.get("VLLM_DYNAMO_USE_CUSTOM_DISPATCHER", "True").lower() in
+     ("true", "1")),
+
+    # Internal flag to control whether we use custom op,
+    # or use the native pytorch implementation
+    "VLLM_TEST_COMPILE_NO_CUSTOM_OPS":
+    lambda: int(os.environ.get("VLLM_TEST_COMPILE_NO_CUSTOM_OPS", "0")),
 
     # Internal flag to enable Dynamo fullgraph capture
     "VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE":

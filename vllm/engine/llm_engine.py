@@ -548,7 +548,7 @@ class LLMEngine:
         """Add a processed request to the engine's request pool.
         return the created sequence group.
         """
-        if isinstance(params, SamplingParams) and params.n > 1:
+        if isinstance(params, SamplingParams) and not params.use_beam_search and params.n > 1:
             ParallelSampleSequenceGroup.add_request(
                 request_id,
                 self,

@@ -29,6 +29,7 @@ class RequestFuncInput:
     output_len: int
     model: str
     model_name: Optional[str] = None
+    use_beam_search: bool = False
     logprobs: Optional[int] = None
     extra_body: Optional[dict] = None
     multi_modal_content: Optional[dict | list[dict]] = None
@@ -60,6 +61,7 @@ async def async_request_tgi(
     async with aiohttp.ClientSession(
         trust_env=True, timeout=AIOHTTP_TIMEOUT
     ) as session:
+        assert not request_func_input.use_beam_search
         params = {
             "max_new_tokens": request_func_input.output_len,
             "do_sample": True,
@@ -141,6 +143,7 @@ async def async_request_trt_llm(
     async with aiohttp.ClientSession(
         trust_env=True, timeout=AIOHTTP_TIMEOUT
     ) as session:
+        assert not request_func_input.use_beam_search
         payload = {
             "accumulate_tokens": True,
             "text_input": request_func_input.prompt,
@@ -214,6 +217,7 @@ async def async_request_deepspeed_mii(
     async with aiohttp.ClientSession(
         trust_env=True, timeout=AIOHTTP_TIMEOUT
     ) as session:
+        assert not request_func_input.use_beam_search
         payload = {
             "model": request_func_input.model,
             "prompt": request_func_input.prompt,
@@ -277,6 +281,7 @@ async def async_request_openai_completions(
     async with aiohttp.ClientSession(
         trust_env=True, timeout=AIOHTTP_TIMEOUT
     ) as session:
+        assert not request_func_input.use_beam_search
         payload = {
             "model": request_func_input.model_name
             if request_func_input.model_name
@@ -377,6 +382,7 @@ async def async_request_openai_chat_completions(
     async with aiohttp.ClientSession(
         trust_env=True, timeout=AIOHTTP_TIMEOUT
     ) as session:
+        assert not request_func_input.use_beam_search
         content = [{"type": "text", "text": request_func_input.prompt}]
         if request_func_input.multi_modal_content:
             mm_content = request_func_input.multi_modal_content

@@ -609,6 +609,25 @@ class Sequence:
     def get_cumulative_logprob(self) -> float:
         return self.data.cumulative_logprob
 
+    def get_beam_search_score(self,
+                              length_penalty: float = 1.0,
+                              seq_len: Optional[int] = None,
+                              eos_token_id: Optional[int] = None) -> float:
+        """Calculate the beam search score with length penalty.
+
+        Adapted from
+
+        https://github.com/huggingface/transformers/blob/ccb92be23def445f2afdea94c31286f84b89eb5b/src/transformers/generation/beam_search.py#L938
+        """
+        if seq_len is None:
+            seq_len = self.get_len()
+            # NOTE: HF implementation does not count the EOS token
+            # towards the length, we align with that here for testing.
+            if (eos_token_id is not None
+                    and self.get_last_token_id() == eos_token_id):
+                seq_len -= 1
+        return self.get_cumulative_logprob() / (seq_len**length_penalty)
+
     def is_finished(self) -> bool:
         return SequenceStatus.is_finished(self.status)
 
@@ -689,9 +708,9 @@ class SequenceGroup:
                  draft_size: int = 1) -> None:
         self.request_id = request_id
         self.seqs = seqs
-        self.first_seq = seqs[0]
+        # self.first_seq = seqs[0]
         self.arrival_time = arrival_time
-        self.is_single_seq = len(seqs) == 1
+        # self.is_single_seq = len(seqs) == 1
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
 
         self.sampling_params = sampling_params
@@ -735,6 +754,14 @@ class SequenceGroup:
         # distinct from the decoder's.
         return (self.encoder_seq.prompt_token_ids
                 if self.encoder_seq is not None else None)
+
+    @property
+    def first_seq(self) -> Sequence:
+        return self.seqs[0]
+    
+    @property
+    def is_single_seq(self) -> int:
+        return len(self.seqs) == 1
 
     @property
     def multi_modal_data(self) -> MultiModalKwargs:
@@ -796,9 +823,16 @@ class SequenceGroup:
     def get_max_num_running_seqs(self) -> int:
         """The maximum number of sequences running in parallel in the remaining
         lifetime of the request."""
-        if self.is_single_seq:
-            return 0 if self.first_seq.is_finished() else 1
-        return self.num_seqs() - self.num_finished_seqs()
+        if self.sampling_params and self.sampling_params.use_beam_search:
+            # For beam search, maximally there will always be `best_of` beam
+            # candidates running in the future.
+            n = self.sampling_params.n
+            assert isinstance(n, int)
+            return n
+        else:
+            if self.is_single_seq:
+                return 0 if self.first_seq.is_finished() else 1
+            return self.num_seqs() - self.num_finished_seqs()
 
     def get_seqs(
         self,

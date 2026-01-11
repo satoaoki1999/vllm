@@ -1493,9 +1493,10 @@ class Scheduler:
     def _allow_async_output_proc(self, seq_group: SequenceGroup) -> bool:
         # async_output_proc is allowed only when we have a single sequence
         # in the sequence group
-        no_single_seq = seq_group.sampling_params is None or (
-            seq_group.sampling_params.n == 1)
-        return no_single_seq
+        async_allowed = seq_group.sampling_params is None or (
+            seq_group.sampling_params.n == 1 
+            and not seq_group.sampling_params.use_beam_search)
+        return async_allowed
 
     def schedule(
             self

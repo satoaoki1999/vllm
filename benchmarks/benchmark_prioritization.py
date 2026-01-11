@@ -75,6 +75,7 @@ def sample_requests(
 def run_vllm(
     requests: list[tuple[str, int, int]],
     n: int,
+    use_beam_search: bool,
     engine_args: EngineArgs,
     disable_detokenize: bool = False,
 ) -> float:
@@ -100,8 +101,9 @@ def run_vllm(
         sampling_params.append(
             SamplingParams(
                 n=n,
-                temperature=1.0,
+                temperature=0.0 if use_beam_search else 1.0,
                 top_p=1.0,
+                use_beam_search=use_beam_search,
                 ignore_eos=True,
                 max_tokens=output_len,
                 detokenize=not disable_detokenize,
@@ -136,7 +138,7 @@ def main(args: argparse.Namespace):
 
     if args.backend == "vllm":
         elapsed_time = run_vllm(
-            requests, args.n, EngineArgs.from_cli_args(args), args.disable_detokenize
+            requests, args.n, args.use_beam_search, EngineArgs.from_cli_args(args), args.disable_detokenize
         )
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
@@ -185,6 +187,7 @@ def create_argument_parser():
     parser.add_argument(
         "--n", type=int, default=1, help="Number of generated sequences per prompt."
     )
+    parser.add_argument("--use-beam-search", action="store_true")
     parser.add_argument(
         "--num-prompts", type=int, default=200, help="Number of prompts to process."
     )

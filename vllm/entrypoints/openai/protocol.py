@@ -447,6 +447,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
     length_penalty: float = 1.0
+    early_stopping: bool = False
     stop_token_ids: Optional[list[int]] = []
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -720,11 +721,14 @@ class ChatCompletionRequest(OpenAIBaseModel):
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens,
             min_tokens=self.min_tokens,
+            use_beam_search=self.use_beam_search,
+            early_stopping=self.early_stopping,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             logits_processors=get_logits_processors(self.logits_processors,
                                                     logits_processor_pattern),
             include_stop_str_in_output=self.include_stop_str_in_output,
+            length_penalty=self.length_penalty,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             output_kind=RequestOutputKind.DELTA if self.stream \
                 else RequestOutputKind.FINAL_ONLY,
@@ -990,6 +994,7 @@ class CompletionRequest(OpenAIBaseModel):
     min_p: Optional[float] = None
     repetition_penalty: Optional[float] = None
     length_penalty: float = 1.0
+    early_stopping: bool = False
     stop_token_ids: Optional[list[int]] = []
     include_stop_str_in_output: bool = False
     ignore_eos: bool = False
@@ -1213,12 +1218,15 @@ class CompletionRequest(OpenAIBaseModel):
             ignore_eos=self.ignore_eos,
             max_tokens=max_tokens if not echo_without_generation else 1,
             min_tokens=self.min_tokens,
+            use_beam_search=self.use_beam_search,
+            early_stopping=self.early_stopping,
             prompt_logprobs=prompt_logprobs,
             skip_special_tokens=self.skip_special_tokens,
             spaces_between_special_tokens=self.spaces_between_special_tokens,
             include_stop_str_in_output=self.include_stop_str_in_output,
             logits_processors=get_logits_processors(self.logits_processors,
                                                     logits_processor_pattern),
+            length_penalty=self.length_penalty,
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             output_kind=RequestOutputKind.DELTA if self.stream \
                 else RequestOutputKind.FINAL_ONLY,

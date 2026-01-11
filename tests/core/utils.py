@@ -22,6 +22,7 @@ def create_dummy_prompt(
     prompt_length: int = -1,
     block_size: Optional[int] = None,
     lora_request: Optional[LoRARequest] = None,
+    use_beam_search: bool = False,
     prompt_tokens: Optional[list[int]] = None,
     prompt_embeds: Optional[torch.Tensor] = None,
     min_tokens: int = 0,
@@ -49,7 +50,8 @@ def create_dummy_prompt(
         request_id=request_id,
         seqs=[prompt],
         arrival_time=time.time(),
-        sampling_params=SamplingParams(max_tokens=max_tokens,
+        sampling_params=SamplingParams(use_beam_search=use_beam_search,
+                                       max_tokens=max_tokens,
                                        min_tokens=min_tokens),
         lora_request=lora_request,
     )
@@ -82,6 +84,7 @@ def create_dummy_prompt_encoder_decoder(
     encoder_prompt_length: int,
     block_size: Optional[int] = None,
     lora_request: Optional[LoRARequest] = None,
+    use_beam_search: bool = False,
 ) -> tuple[Sequence, Sequence, SequenceGroup]:
     if not block_size:
         block_size = decoder_prompt_length
@@ -111,6 +114,7 @@ def create_dummy_prompt_encoder_decoder(
 
     seq_group = SequenceGroup(request_id=request_id,
                               seqs=[decoder_prompt],
+                              sampling_params=SamplingParams(use_beam_search=use_beam_search),
                               arrival_time=time.time(),
                               lora_request=lora_request,
                               encoder_seq=encoder_prompt)

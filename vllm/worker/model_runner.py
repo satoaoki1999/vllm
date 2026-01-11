@@ -496,7 +496,8 @@ class ModelInputForGPUBuilder(ModelRunnerInputBuilderBase[ModelInputForGPU]):
         if inter_data.is_prompt:
             context_len = seq_data.get_num_computed_tokens()
             seq_len = min(seq_len, context_len + token_chunk_size)
-        elif self.runner.model_config.is_encoder_decoder:
+        elif self.runner.model_config.is_encoder_decoder or \
+            seq_group_metadata.sampling_params.use_beam_search:
             context_len = seq_len - 1
         else:
             context_len = seq_data.get_num_computed_tokens()
